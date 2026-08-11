@@ -22,7 +22,7 @@ class TelegramError(Exception):
     """Raised when the Telegram API returns an error or is unreachable."""
 
 
-MessageHandler = Callable[[str], Awaitable[str]]
+MessageHandler = Callable[[str, str], Awaitable[str]]
 
 
 def split_telegram_message(text: str, limit: int = SAFE_CHUNK_LEN) -> list[str]:
@@ -253,7 +253,7 @@ class TelegramPoller:
             return
 
         try:
-            reply = await self._handler(text.strip())
+            reply = await self._handler(text.strip(), chat_id)
         except Exception:
             logger.exception("Agent failed while handling Telegram message")
             reply = "⚠️ Something went wrong while processing that. Please try again."

@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.agent import PersonalAgent, process_message
+from app.agent.state import ConversationStore
 from app.config import ConfigurationError, get_settings
 from app.integrations.google_auth import (
     GoogleAuthError,
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
     app.state.mcp_client = create_default_mcp_client()
     app.state.llm = LLMService(settings)
     app.state.agent = PersonalAgent(app.state.mcp_client, app.state.llm)
+    app.state.conversation_store = ConversationStore(max_messages=20)
     logger.info(
         "MCP client ready with tools: %s",
         [t.name for t in app.state.mcp_client.list_tools()],
@@ -57,8 +59,22 @@ async def lifespan(app: FastAPI):
     if settings.telegram_configured:
         telegram = TelegramService.from_settings(settings)
 
-        async def _handle(text: str) -> str:
-            return await process_message(text, app.state.agent)
+        async def _handle(text: str, chat_id: str) -> str:
+            async def _run(
+                current_message: str,
+                history: list[dict[str, str]],
+            ) -> str:
+                return await process_message(
+                    current_message,
+                    app.state.agent,
+                    conversation_history=history,
+                )
+
+            return await app.state.conversation_store.process_turn(
+                chat_id,
+                text,
+                _run,
+            )
 
         poller = TelegramPoller(telegram, _handle)
         app.state.telegram_poller = poller
@@ -227,7 +243,22 @@ async def test_agent(payload: dict[str, Any] | None = None) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Provide JSON {\"message\": \"...\"}")
 
     agent: PersonalAgent = app.state.agent
-    reply = await process_message(message, agent)
+    conversation_id = "test-agent"
+    if isinstance(payload, dict) and payload.get("conversation_id") is not None:
+        conversation_id = str(payload["conversation_id"])
+
+    async def _run(
+        current_message: str,
+        history: list[dict[str, str]],
+    ) -> str:
+        return await process_message(
+            current_message,
+            agent,
+            conversation_history=history,
+        )
+
+    store: ConversationStore = app.state.conversation_store
+    reply = await store.process_turn(conversation_id, message, _run)
     return JSONResponse({"status": "ok", "reply": reply})
 
 

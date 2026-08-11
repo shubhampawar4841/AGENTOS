@@ -94,7 +94,6 @@ class LLMService:
             if not response.content:
                 raise LLMError("LLM returned an empty response")
             return response.content
-            )
         if provider == "gemini":
             return await self._gemini(
                 system_prompt=system_prompt,
