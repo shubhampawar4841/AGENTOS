@@ -1,4 +1,4 @@
-"""In-process MCP client used by the future agent layer."""
+"""In-process MCP client used by the agent layer."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import logging
 from typing import Any
 
 from app.mcp import MCPError, MCPServer, MCPTool
+from app.mcp.servers.calendar import CalendarMCPServer
 from app.mcp.servers.gmail import GmailMCPServer
+from app.mcp.servers.youtube import YouTubeMCPServer
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +17,8 @@ class MCPClient:
     """
     Discovers and invokes tools exposed by MCP servers.
 
-    Pattern for later milestones:
-        Agent → MCPClient → GmailMCPServer → Gmail API
+    Pattern:
+        Agent → MCPClient → Gmail/Calendar/YouTube MCP servers → Google APIs
     """
 
     def __init__(self) -> None:
@@ -45,7 +47,6 @@ class MCPClient:
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any] | None = None) -> Any:
         """Resolve a tool by fully-qualified name and invoke it."""
-        # Prefer prefix routing: "gmail.get_today_emails" → server "gmail"
         if "." in tool_name:
             server_name, _ = tool_name.split(".", 1)
             server = self._servers.get(server_name)
@@ -53,7 +54,6 @@ class MCPClient:
                 logger.debug("Calling MCP tool '%s' via server '%s'", tool_name, server_name)
                 return await server.call_tool(tool_name, arguments)
 
-        # Fallback: search all servers
         for server in self._servers.values():
             names = {t.name for t in server.list_tools()}
             if tool_name in names:
@@ -67,4 +67,6 @@ def create_default_mcp_client() -> MCPClient:
     """Build the default MCP client with built-in servers registered."""
     client = MCPClient()
     client.register_server(GmailMCPServer())
+    client.register_server(CalendarMCPServer())
+    client.register_server(YouTubeMCPServer())
     return client

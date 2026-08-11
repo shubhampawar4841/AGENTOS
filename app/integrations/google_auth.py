@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -18,13 +19,17 @@ from app.config import ConfigurationError, Settings, get_settings
 logger = logging.getLogger(__name__)
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-SCOPES = [GMAIL_READONLY_SCOPE]
+CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+YOUTUBE_READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+SCOPES = [
+    GMAIL_READONLY_SCOPE,
+    CALENDAR_READONLY_SCOPE,
+    YOUTUBE_READONLY_SCOPE,
+]
 
-# Single-user local CSRF state for the in-progress OAuth flow. The PKCE
-# code_verifier generated when building the authorization URL must be replayed
-# at token exchange, otherwise Google rejects the code with invalid_grant.
-_pending_oauth_state: str | None = None
-_pending_code_verifier: str | None = None
+# Persist PKCE verifier + state to disk so uvicorn --reload (or multi-process)
+# cannot wipe in-memory globals between /auth/google and the callback.
+PENDING_OAUTH_PATH = Path("tokens/google_oauth_pending.json")
 
 
 def _allow_insecure_transport_for_local_dev(redirect_uri: str) -> None:
@@ -43,6 +48,38 @@ def _code_fingerprint(authorization_response: str) -> str:
     if not code:
         return "none"
     return hashlib.sha256(code.encode()).hexdigest()[:8]
+
+
+def _save_pending_oauth(state: str, code_verifier: str) -> None:
+    PENDING_OAUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_OAUTH_PATH.write_text(
+        json.dumps({"state": state, "code_verifier": code_verifier}),
+        encoding="utf-8",
+    )
+
+
+def _load_pending_oauth() -> tuple[str | None, str | None]:
+    if not PENDING_OAUTH_PATH.exists():
+        return None, None
+    try:
+        data = json.loads(PENDING_OAUTH_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    state = data.get("state")
+    verifier = data.get("code_verifier")
+    return (
+        state if isinstance(state, str) else None,
+        verifier if isinstance(verifier, str) else None,
+    )
+
+
+def _clear_pending_oauth() -> None:
+    try:
+        PENDING_OAUTH_PATH.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to clear pending OAuth file")
 
 
 class GoogleAuthError(Exception):
@@ -89,19 +126,17 @@ def build_authorization_url(settings: Settings | None = None) -> tuple[str, str]
 
     Requests offline access so a refresh token is issued.
     """
-    global _pending_oauth_state, _pending_code_verifier
-
     settings = settings or get_settings()
     flow = create_oauth_flow(settings)
-    # Deliberately omit include_granted_scopes so we only ever request
-    # gmail.readonly and don't drag in unrelated previously-granted scopes.
+    # Deliberately omit include_granted_scopes so we only request the
+    # explicitly configured read-only Gmail/Calendar/YouTube scopes.
     auth_url, state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
     )
-    _pending_oauth_state = state
-    # authorization_url() generates the PKCE verifier as a side effect.
-    _pending_code_verifier = flow.code_verifier
+    if not flow.code_verifier:
+        raise GoogleAuthError("Failed to generate PKCE verifier for Google OAuth.")
+    _save_pending_oauth(state=state, code_verifier=flow.code_verifier)
     logger.info("Google OAuth authorization URL generated")
     return auth_url, state
 
@@ -112,20 +147,20 @@ def exchange_code_for_tokens(
     settings: Settings | None = None,
 ) -> Credentials:
     """Exchange an OAuth callback response for credentials and persist them."""
-    global _pending_oauth_state, _pending_code_verifier
-
     settings = settings or get_settings()
-    if state is not None and _pending_oauth_state is not None and state != _pending_oauth_state:
+    pending_state, pending_verifier = _load_pending_oauth()
+
+    if state is not None and pending_state is not None and state != pending_state:
         raise GoogleAuthError("Invalid OAuth state. Start again at /auth/google.")
 
-    if _pending_code_verifier is None:
+    if not pending_verifier:
         raise GoogleAuthError(
-            "No OAuth flow is in progress on this server process, so the PKCE "
-            "verifier is unavailable. Start again at /auth/google."
+            "No OAuth flow is in progress (PKCE verifier missing). "
+            "Start again at /auth/google."
         )
 
     try:
-        flow = create_oauth_flow(settings, state=state, code_verifier=_pending_code_verifier)
+        flow = create_oauth_flow(settings, state=state, code_verifier=pending_verifier)
         logger.info(
             "Exchanging Google authorization code (code_fp=%s, pkce=yes)",
             _code_fingerprint(authorization_response),
@@ -154,8 +189,7 @@ def exchange_code_for_tokens(
 
     credentials = flow.credentials
     save_credentials(credentials, settings.google_token_file())
-    _pending_oauth_state = None
-    _pending_code_verifier = None
+    _clear_pending_oauth()
     logger.info("Google OAuth credentials saved locally")
     return credentials
 
@@ -184,6 +218,16 @@ def load_credentials(token_path: Path | str, scopes: list[str] | None = None) ->
         ) from exc
 
 
+def missing_scopes(credentials: Credentials, required: list[str] | None = None) -> list[str]:
+    """Return required scopes that are not present on the credential."""
+    needed = required or SCOPES
+    raw = credentials.scopes or []
+    if not isinstance(raw, (list, tuple, set)):
+        return list(needed)
+    granted = {s for s in raw if isinstance(s, str) and s}
+    return [scope for scope in needed if scope not in granted]
+
+
 def get_valid_credentials(settings: Settings | None = None) -> Credentials:
     """
     Return usable Google credentials, refreshing the access token when needed.
@@ -192,6 +236,17 @@ def get_valid_credentials(settings: Settings | None = None) -> Credentials:
     """
     settings = settings or get_settings()
     credentials = load_credentials(settings.google_token_file(), SCOPES)
+
+    missing = missing_scopes(credentials, SCOPES)
+    if missing:
+        logger.warning(
+            "Stored Google credentials are missing %s required scope(s); re-auth required",
+            len(missing),
+        )
+        raise GoogleAuthRequiredError(
+            "Google credentials are missing Calendar/YouTube (or Gmail) scopes. "
+            "Open /auth/google to re-authenticate and grant the new permissions."
+        )
 
     if credentials.valid:
         return credentials

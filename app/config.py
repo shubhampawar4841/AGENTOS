@@ -16,6 +16,7 @@ load_dotenv()
 
 DEFAULT_GOOGLE_REDIRECT_URI = "http://localhost:3000/auth/google/callback"
 DEFAULT_GOOGLE_TOKEN_PATH = "tokens/google_token.json"
+DEFAULT_LLM_PROVIDER = "none"
 
 
 class ConfigurationError(Exception):
@@ -35,6 +36,11 @@ class Settings:
     google_client_secret: str | None
     google_redirect_uri: str
     google_token_path: str
+    llm_provider: str
+    llm_api_key: str | None
+    llm_model: str | None
+    llm_base_url: str | None
+    youtube_channel_ids: tuple[str, ...]
 
     @property
     def telegram_configured(self) -> bool:
@@ -43,6 +49,11 @@ class Settings:
     @property
     def google_configured(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
+
+    @property
+    def llm_configured(self) -> bool:
+        provider = (self.llm_provider or "none").lower()
+        return provider not in {"", "none", "off", "disabled"} and bool(self.llm_api_key)
 
     def require_telegram(self) -> tuple[str, str]:
         """Return Telegram credentials or raise if missing."""
@@ -88,6 +99,13 @@ def _optional(name: str) -> str | None:
     return value or None
 
 
+def _csv_ids(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Load and cache settings from the environment."""
@@ -107,6 +125,14 @@ def get_settings() -> Settings:
             os.getenv("GOOGLE_TOKEN_PATH", DEFAULT_GOOGLE_TOKEN_PATH).strip()
             or DEFAULT_GOOGLE_TOKEN_PATH
         ),
+        llm_provider=(
+            os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
+            or DEFAULT_LLM_PROVIDER
+        ),
+        llm_api_key=_optional("LLM_API_KEY"),
+        llm_model=_optional("LLM_MODEL"),
+        llm_base_url=_optional("LLM_BASE_URL"),
+        youtube_channel_ids=_csv_ids("YOUTUBE_CHANNEL_IDS"),
     )
     # Validate scheduler config eagerly so bad values fail fast at startup.
     settings.briefing_hour_minute()

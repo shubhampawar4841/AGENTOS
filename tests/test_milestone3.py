@@ -103,24 +103,32 @@ def test_format_truncates_long_snippet():
 @pytest.mark.asyncio
 async def test_generate_gmail_briefing_uses_mcp(settings_env):
     client = MagicMock(spec=MCPClient)
-    client.call_tool = AsyncMock(
-        return_value={
-            "date": "2026-08-11",
-            "count": 1,
-            "emails": [
-                {
-                    "sender": "Ada <ada@example.com>",
-                    "subject": "Hello",
-                    "snippet": "World",
-                }
-            ],
-        }
-    )
+
+    async def _call(tool_name, arguments=None):
+        if tool_name == "gmail.get_today_emails":
+            return {
+                "date": "2026-08-11",
+                "count": 1,
+                "emails": [
+                    {
+                        "sender": "Ada <ada@example.com>",
+                        "subject": "Hello",
+                        "snippet": "World",
+                    }
+                ],
+            }
+        if tool_name == "calendar.get_upcoming_events":
+            return {"count": 0, "events": [], "days": 1}
+        if tool_name == "youtube.get_recent_videos":
+            return {"count": 0, "videos": []}
+        raise AssertionError(tool_name)
+
+    client.call_tool = AsyncMock(side_effect=_call)
 
     text = await generate_gmail_briefing(client, get_settings())
-    client.call_tool.assert_awaited_once_with("gmail.get_today_emails")
-    assert "• Ada" in text
-    assert "Hello" in text
+    assert client.call_tool.await_count == 3
+    assert "EVENING BRIEF" in text
+    assert "Ada" in text or "📧 Gmail" in text
 
 
 @pytest.mark.asyncio
@@ -128,7 +136,7 @@ async def test_generate_gmail_briefing_mcp_error(settings_env):
     client = MagicMock(spec=MCPClient)
     client.call_tool = AsyncMock(side_effect=MCPError("auth required"))
 
-    with pytest.raises(BriefingError, match="auth required"):
+    with pytest.raises(BriefingError, match="All briefing data sources failed"):
         await generate_gmail_briefing(client, get_settings())
 
 

@@ -55,7 +55,7 @@ def test_require_google_missing(monkeypatch):
         get_settings().require_google()
 
 
-def test_pkce_verifier_survives_into_token_exchange(settings_env):
+def test_pkce_verifier_survives_into_token_exchange(settings_env, tmp_path, monkeypatch):
     """
     Google enables PKCE by default in google-auth-oauthlib. The verifier created
     while building the authorization URL must be replayed at token exchange,
@@ -67,13 +67,16 @@ def test_pkce_verifier_survives_into_token_exchange(settings_env):
 
     import app.integrations.google_auth as ga
 
+    monkeypatch.setattr(ga, "PENDING_OAUTH_PATH", tmp_path / "pending.json")
+
     url, state = ga.build_authorization_url()
     query = parse_qs(urlparse(url).query)
 
     assert query["code_challenge_method"][0] == "S256"
     sent_challenge = query["code_challenge"][0]
 
-    verifier = ga._pending_code_verifier
+    pending_state, verifier = ga._load_pending_oauth()
+    assert pending_state == state
     assert verifier is not None
 
     digest = hashlib.sha256(verifier.encode()).digest()
@@ -84,10 +87,11 @@ def test_pkce_verifier_survives_into_token_exchange(settings_env):
     assert flow.code_verifier == verifier
 
 
-def test_exchange_without_pending_flow_is_rejected(settings_env):
+def test_exchange_without_pending_flow_is_rejected(settings_env, tmp_path, monkeypatch):
     import app.integrations.google_auth as ga
 
-    ga._pending_code_verifier = None
+    monkeypatch.setattr(ga, "PENDING_OAUTH_PATH", tmp_path / "pending.json")
+    ga._clear_pending_oauth()
     with pytest.raises(Exception, match="/auth/google"):
         ga.exchange_code_for_tokens(
             authorization_response="http://localhost:3000/auth/google/callback?code=x&state=y"
@@ -127,6 +131,8 @@ def test_get_valid_credentials_missing_file(settings_env):
 
 
 def test_get_valid_credentials_refreshes_expired(settings_env, tmp_path):
+    from app.integrations.google_auth import SCOPES
+
     path = settings_env
     path.write_text(
         json.dumps(
@@ -136,7 +142,7 @@ def test_get_valid_credentials_refreshes_expired(settings_env, tmp_path):
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "client_id": "client-id",
                 "client_secret": "client-secret",
-                "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+                "scopes": SCOPES,
                 "expiry": "2000-01-01T00:00:00Z",
             }
         ),
@@ -154,7 +160,7 @@ def test_get_valid_credentials_refreshes_expired(settings_env, tmp_path):
             "token_uri": "https://oauth2.googleapis.com/token",
             "client_id": "client-id",
             "client_secret": "client-secret",
-            "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+            "scopes": SCOPES,
         }
     )
 
@@ -164,6 +170,7 @@ def test_get_valid_credentials_refreshes_expired(settings_env, tmp_path):
             valid=False,
             expired=True,
             refresh_token="refresh-token",
+            scopes=list(SCOPES),
             refresh=MagicMock(side_effect=lambda _req: setattr(refreshed, "valid", True)),
         ),
     ) as load_mock:

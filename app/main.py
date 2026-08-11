@@ -10,17 +10,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from app.agent import PersonalAgent, process_message
 from app.config import ConfigurationError, get_settings
 from app.integrations.google_auth import (
     GoogleAuthError,
     build_authorization_url,
     exchange_code_for_tokens,
 )
-from app.integrations.telegram import TelegramError, TelegramService
+from app.integrations.telegram import TelegramError, TelegramPoller, TelegramService
 from app.mcp import MCPError
 from app.mcp.client import MCPClient, create_default_mcp_client
 from app.scheduler.jobs import create_scheduler
 from app.services.briefing import BriefingError, send_evening_briefing
+from app.services.llm import LLMService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,8 +35,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     scheduler: AsyncIOScheduler | None = None
+    poller: TelegramPoller | None = None
 
     app.state.mcp_client = create_default_mcp_client()
+    app.state.llm = LLMService(settings)
+    app.state.agent = PersonalAgent(app.state.mcp_client, app.state.llm)
     logger.info(
         "MCP client ready with tools: %s",
         [t.name for t in app.state.mcp_client.list_tools()],
@@ -49,9 +54,27 @@ async def lifespan(app: FastAPI):
         logger.error("Scheduler configuration error: %s", exc)
         raise
 
+    if settings.telegram_configured:
+        telegram = TelegramService.from_settings(settings)
+
+        async def _handle(text: str) -> str:
+            return await process_message(text, app.state.agent)
+
+        poller = TelegramPoller(telegram, _handle)
+        app.state.telegram_poller = poller
+        await poller.start()
+    else:
+        app.state.telegram_poller = None
+        logger.warning(
+            "Telegram polling not started "
+            "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
+        )
+
     try:
         yield
     finally:
+        if poller is not None:
+            await poller.stop()
         if scheduler is not None and scheduler.running:
             scheduler.shutdown(wait=False)
             logger.info("Scheduler shut down")
@@ -60,7 +83,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Personal Agentic OS",
     description="Single-user personal AI assistant foundation",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -192,6 +215,20 @@ async def test_briefing() -> JSONResponse:
             "message": "Evening briefing sent to Telegram",
         }
     )
+
+
+@app.post("/test/agent")
+async def test_agent(payload: dict[str, Any] | None = None) -> JSONResponse:
+    """Process a message through the agent without Telegram polling."""
+    message = ""
+    if isinstance(payload, dict):
+        message = str(payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Provide JSON {\"message\": \"...\"}")
+
+    agent: PersonalAgent = app.state.agent
+    reply = await process_message(message, agent)
+    return JSONResponse({"status": "ok", "reply": reply})
 
 
 @app.get("/mcp/tools")
