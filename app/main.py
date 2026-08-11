@@ -11,7 +11,8 @@ from fastapi import FastAPI, Header, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.agent import PersonalAgent, process_message
-from app.agent.state import ConversationStore
+from app.agent.agent import run_agent_turn
+from app.agent.state import AgentRunResult, ConversationStore
 from app.config import ConfigurationError, Settings, get_settings
 from app.integrations.google_auth import (
     GoogleAuthError,
@@ -44,11 +45,13 @@ def _build_telegram_message_handler(app: FastAPI):
         async def _run(
             current_message: str,
             history: list[dict[str, str]],
-        ) -> str:
-            return await process_message(
+            verified: dict[str, Any],
+        ) -> AgentRunResult:
+            return await run_agent_turn(
                 current_message,
                 app.state.agent,
                 conversation_history=history,
+                verified_context=verified,
             )
 
         return await app.state.conversation_store.process_turn(
@@ -373,11 +376,13 @@ async def test_agent(payload: dict[str, Any] | None = None) -> JSONResponse:
     async def _run(
         current_message: str,
         history: list[dict[str, str]],
+        verified: dict[str, Any],
     ) -> str:
         return await process_message(
             current_message,
             agent,
             conversation_history=history,
+            verified_context=verified,
         )
 
     store: ConversationStore = app.state.conversation_store

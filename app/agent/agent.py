@@ -1,4 +1,4 @@
-"""SYNCOS conversational agent with native LLM tool calling."""
+"""SYNCOS conversational agent with native LLM tool calling and provenance checks."""
 
 from __future__ import annotations
 
@@ -13,18 +13,33 @@ from app.agent.formatters import (
     format_today_emails,
     format_youtube_videos,
 )
-from app.agent.prompts import START_MESSAGE, SYNCOS_SYSTEM_PROMPT, UNKNOWN_MESSAGE
+from app.agent.guardrails import (
+    review_assistant_content,
+    strip_raw_tool_syntax,
+    tool_service,
+)
+from app.agent.prompts import (
+    START_MESSAGE,
+    SYNCOS_SYSTEM_PROMPT,
+    TOOL_ENFORCEMENT_REMINDER,
+    UNKNOWN_MESSAGE,
+)
 from app.agent.router import (
     ALLOWED_AGENT_TOOLS,
     Intent,
     detect_intent,
     plan_tool_calls,
 )
+from app.agent.state import AgentRunResult, ToolExecution
 from app.mcp import MCPError
 from app.mcp.client import MCPClient
 from app.services.llm import LLMChatResponse, LLMError, LLMService, LLMToolCall
 
 logger = logging.getLogger(__name__)
+
+LLM_TROUBLE_MESSAGE = (
+    "I'm having trouble thinking right now. Please try again in a moment."
+)
 
 
 class AgentError(Exception):
@@ -36,6 +51,7 @@ class PersonalAgent:
 
     MAX_TOOL_ROUNDS = 4
     MAX_TOOL_RESULT_CHARS = 12_000
+    MAX_VERIFIED_CONTEXT_CHARS = 6_000
 
     def __init__(
         self,
@@ -49,44 +65,146 @@ class PersonalAgent:
         self,
         message: str,
         conversation_history: list[dict[str, Any]] | None = None,
+        verified_context: dict[str, Any] | None = None,
     ) -> str:
-        """Process one user turn using recent history and an MCP tool loop."""
+        """Process one turn and return only the user-facing reply."""
+        result = await self.run(message, conversation_history, verified_context)
+        return result.response
+
+    async def run(
+        self,
+        message: str,
+        conversation_history: list[dict[str, Any]] | None = None,
+        verified_context: dict[str, Any] | None = None,
+    ) -> AgentRunResult:
+        """
+        Process one user turn using recent history and a verified MCP tool loop.
+
+        External data may only be described when a tool execution in this run,
+        or a verified result carried in `verified_context`, actually returned it.
+        """
         text = (message or "").strip()
         if not text:
-            return "What would you like help with?"
+            return AgentRunResult(response="What would you like help with?")
+
+        logger.info("Agent request received (chars=%d)", len(text))
         if not self._llm.enabled:
             return await self._deterministic_fallback(text)
 
+        tool_log: list[ToolExecution] = []
+        verified_context = verified_context or {}
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYNCOS_SYSTEM_PROMPT},
-            *self._clean_history(conversation_history or []),
-            {"role": "user", "content": text},
+            {"role": "system", "content": SYNCOS_SYSTEM_PROMPT}
         ]
+        context_message = self._verified_context_message(verified_context)
+        if context_message:
+            messages.append(context_message)
+        messages.extend(self._clean_history(conversation_history or []))
+        messages.append({"role": "user", "content": text})
+
         tools = self._tool_catalog()
+        enforcement_used = False
 
         try:
             for _round in range(self.MAX_TOOL_ROUNDS):
                 response = await self._llm.chat(messages, tools=tools)
-                if not response.tool_calls:
-                    return response.content or "Could you rephrase that?"
 
-                messages.append(self._assistant_tool_message(response))
-                for call in response.tool_calls:
-                    result = await self._execute_tool_call(call)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "name": call.name,
-                            "content": result,
-                        }
+                if response.tool_calls:
+                    messages.append(self._assistant_tool_message(response))
+                    for call in response.tool_calls:
+                        logger.info("LLM requested tool: %s", call.name)
+                        payload, execution = await self._execute_tool_call(call)
+                        tool_log.append(execution)
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "name": call.name,
+                                "content": payload,
+                            }
+                        )
+                        logger.info("Returning tool result to LLM: %s", execution.tool_name)
+                    continue
+
+                verdict = review_assistant_content(
+                    response.content or "",
+                    self._verified_services(tool_log, verified_context),
+                )
+                if verdict.ok:
+                    logger.info("LLM final response generated")
+                    return AgentRunResult(
+                        response=verdict.safe_response or "Could you rephrase that?",
+                        tools_executed=tuple(tool_log),
                     )
+
+                if not enforcement_used:
+                    enforcement_used = True
+                    logger.warning(
+                        "Blocked unverified response (reason=%s, services=%s); "
+                        "requiring real tool execution",
+                        verdict.reason,
+                        ",".join(verdict.unverified_services) or "none",
+                    )
+                    messages.append(
+                        {"role": "system", "content": TOOL_ENFORCEMENT_REMINDER}
+                    )
+                    continue
+
+                logger.error(
+                    "Refusing to send unverified response (reason=%s)", verdict.reason
+                )
+                return AgentRunResult(
+                    response=verdict.safe_response,
+                    tools_executed=tuple(tool_log),
+                )
         except LLMError as exc:
             logger.error("SYNCOS LLM failed: %s", exc)
-            return "I'm having trouble thinking right now. Please try again in a moment."
+            return AgentRunResult(
+                response=LLM_TROUBLE_MESSAGE,
+                tools_executed=tuple(tool_log),
+            )
 
         logger.warning("SYNCOS reached the tool-call round limit")
-        return "I couldn't finish that safely. Please narrow the request and try again."
+        return AgentRunResult(
+            response="I couldn't finish that safely. Please narrow the request and try again.",
+            tools_executed=tuple(tool_log),
+        )
+
+    @staticmethod
+    def _verified_services(
+        tool_log: list[ToolExecution],
+        verified_context: dict[str, Any],
+    ) -> set[str]:
+        """Services with real data available, from this run or verified context."""
+        services: set[str] = set()
+        for execution in tool_log:
+            if execution.success:
+                service = tool_service(execution.tool_name)
+                if service:
+                    services.add(service)
+        for tool_name in verified_context:
+            service = tool_service(tool_name)
+            if service:
+                services.add(service)
+        return services
+
+    def _verified_context_message(
+        self,
+        verified_context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not verified_context:
+            return None
+        payload = json.dumps(verified_context, ensure_ascii=False, default=str)[
+            : self.MAX_VERIFIED_CONTEXT_CHARS
+        ]
+        return {
+            "role": "system",
+            "content": (
+                "Verified tool results from earlier in this conversation. This data "
+                "came from real tool executions and is safe to reference. Anything "
+                "not present here has NOT been retrieved:\n" + payload
+            ),
+        }
 
     def _tool_catalog(self) -> list[dict[str, Any]]:
         catalog: list[dict[str, Any]] = []
@@ -129,7 +247,7 @@ class PersonalAgent:
             role = item.get("role")
             content = item.get("content")
             if role in {"user", "assistant"} and isinstance(content, str) and content:
-                clean.append({"role": role, "content": content})
+                clean.append({"role": role, "content": strip_raw_tool_syntax(content)})
         return clean
 
     @staticmethod
@@ -150,16 +268,21 @@ class PersonalAgent:
             ],
         }
 
-    async def _execute_tool_call(self, call: LLMToolCall) -> str:
+    async def _execute_tool_call(
+        self,
+        call: LLMToolCall,
+    ) -> tuple[str, ToolExecution]:
+        """Execute one structured tool call and record verifiable provenance."""
         tool_name = self._resolve_tool_name(call.name)
         if tool_name is None:
             logger.warning("Model requested disallowed tool '%s'", call.name)
-            return self._tool_result_json(
-                success=False,
-                error="That capability is not available to this assistant.",
+            return self._failed_execution(
+                call.name,
+                "That capability is not available to this assistant.",
             )
         if call.argument_error:
-            return self._tool_result_json(success=False, error=call.argument_error)
+            logger.warning("Malformed tool arguments for %s", tool_name)
+            return self._failed_execution(tool_name, call.argument_error)
 
         try:
             tool = self._mcp.get_tool(tool_name)
@@ -167,25 +290,32 @@ class PersonalAgent:
         except MCPError:
             validation_error = "The requested tool is not available."
         if validation_error:
-            return self._tool_result_json(success=False, error=validation_error)
+            logger.warning("Rejected tool arguments for %s", tool_name)
+            return self._failed_execution(tool_name, validation_error)
 
+        logger.info("Executing MCP tool: %s", tool_name)
         try:
             result = await self._mcp.call_tool(tool_name, call.arguments)
         except MCPError as exc:
-            logger.error("Agent MCP tool failed (%s): %s", tool_name, exc)
-            return self._tool_result_json(success=False, error=str(exc))
+            logger.error("MCP tool failed: %s: %s", tool_name, exc)
+            return self._failed_execution(tool_name, str(exc))
         if not isinstance(result, dict):
-            return self._tool_result_json(
-                success=False,
-                error="The connected service returned an unexpected response.",
+            logger.error("MCP tool returned unexpected payload: %s", tool_name)
+            return self._failed_execution(
+                tool_name,
+                "The connected service returned an unexpected response.",
             )
-        return json.dumps(result, ensure_ascii=False, default=str)[
+
+        logger.info("MCP tool success: %s", tool_name)
+        payload = json.dumps(result, ensure_ascii=False, default=str)[
             : self.MAX_TOOL_RESULT_CHARS
         ]
+        return payload, ToolExecution(tool_name=tool_name, success=True, result=result)
 
     @staticmethod
-    def _tool_result_json(*, success: bool, error: str) -> str:
-        return json.dumps({"success": success, "error": error}, ensure_ascii=False)
+    def _failed_execution(tool_name: str, error: str) -> tuple[str, ToolExecution]:
+        payload = json.dumps({"success": False, "error": error}, ensure_ascii=False)
+        return payload, ToolExecution(tool_name=tool_name, success=False, error=error)
 
     async def _call_allowed_tool(
         self,
@@ -197,23 +327,38 @@ class PersonalAgent:
         try:
             result = await self._mcp.call_tool(tool_name, arguments)
         except MCPError as exc:
-            logger.error("Agent MCP tool failed: %s", exc)
+            logger.error("MCP tool failed: %s: %s", tool_name, exc)
             raise AgentError(str(exc)) from exc
         if not isinstance(result, dict):
             raise AgentError("MCP tool returned an unexpected payload")
         return result
 
-    async def _deterministic_fallback(self, message: str) -> str:
-        """Compatibility path for tests or installations with no LLM configured."""
+    async def _deterministic_fallback(self, message: str) -> AgentRunResult:
+        """Compatibility path for installations with no LLM configured."""
         intent = detect_intent(message)
         if intent is Intent.START:
-            return START_MESSAGE
+            return AgentRunResult(response=START_MESSAGE)
         calls = plan_tool_calls(message)
         if not calls:
-            return UNKNOWN_MESSAGE
+            return AgentRunResult(response=UNKNOWN_MESSAGE)
+
         results: dict[str, dict[str, Any]] = {}
+        executions: list[ToolExecution] = []
         for call in calls:
-            results[call.name] = await self._call_allowed_tool(call.name, call.arguments)
+            data = await self._call_allowed_tool(call.name, call.arguments)
+            results[call.name] = data
+            executions.append(
+                ToolExecution(tool_name=call.name, success=True, result=data)
+            )
+
+        reply = self._format_deterministic(intent, results)
+        return AgentRunResult(response=reply, tools_executed=tuple(executions))
+
+    @staticmethod
+    def _format_deterministic(
+        intent: Intent,
+        results: dict[str, dict[str, Any]],
+    ) -> str:
         if len(results) == 1:
             name, data = next(iter(results.items()))
             if name == "gmail.get_today_emails":
@@ -259,28 +404,49 @@ def _validate_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> st
     return None
 
 
+def _auth_error_reply(text: str) -> str | None:
+    lower = text.lower()
+    if (
+        "authenticate" in lower
+        or "not connected" in lower
+        or "revoked" in lower
+        or "re-authenticate" in lower
+        or ("missing" in lower and "scope" in lower)
+    ):
+        return (
+            "🔐 Google access needs attention "
+            "(missing scopes, expired token, or not connected).\n"
+            "Open http://localhost:3000/auth/google to reconnect and grant "
+            "Gmail + Calendar + YouTube read-only access."
+        )
+    return None
+
+
+async def run_agent_turn(
+    message: str,
+    agent: PersonalAgent,
+    conversation_history: list[dict[str, Any]] | None = None,
+    verified_context: dict[str, Any] | None = None,
+) -> AgentRunResult:
+    """Run one turn and return the reply plus tool provenance."""
+    try:
+        return await agent.run(message, conversation_history, verified_context)
+    except AgentError as exc:
+        text = str(exc)
+        return AgentRunResult(response=_auth_error_reply(text) or f"⚠️ I couldn't complete that request.\n{text}")
+
+
 async def process_message(
     message: str,
     agent: PersonalAgent,
     conversation_history: list[dict[str, Any]] | None = None,
+    verified_context: dict[str, Any] | None = None,
 ) -> str:
-    """Module-level helper used by the Telegram poller."""
-    try:
-        return await agent.process_message(message, conversation_history)
-    except AgentError as exc:
-        text = str(exc)
-        lower = text.lower()
-        if (
-            "authenticate" in lower
-            or "not connected" in lower
-            or "revoked" in lower
-            or "re-authenticate" in lower
-            or ("missing" in lower and "scope" in lower)
-        ):
-            return (
-                "🔐 Google access needs attention "
-                "(missing scopes, expired token, or not connected).\n"
-                "Open http://localhost:3000/auth/google to reconnect and grant "
-                "Gmail + Calendar + YouTube read-only access."
-            )
-        return f"⚠️ I couldn't complete that request.\n{text}"
+    """Module-level helper returning only the user-facing reply."""
+    result = await run_agent_turn(
+        message,
+        agent,
+        conversation_history,
+        verified_context,
+    )
+    return result.response
