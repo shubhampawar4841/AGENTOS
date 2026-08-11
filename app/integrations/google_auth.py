@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -40,6 +41,22 @@ def _allow_insecure_transport_for_local_dev(redirect_uri: str) -> None:
     # granted scopes). Relax the strict scope-equality check so this does not
     # raise instead of returning a usable gmail.readonly token.
     os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
+
+def generate_code_verifier(length: int = 96) -> str:
+    """
+    Generate a PKCE code_verifier (RFC 7636: 43-128 unreserved chars).
+
+    Generated explicitly rather than relying on library auto-generation so the
+    value is always available to replay at token exchange.
+    """
+    alphabet = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789-._~"
+    )
+    length = max(43, min(length, 128))
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def _code_fingerprint(authorization_response: str) -> str:
@@ -127,16 +144,15 @@ def build_authorization_url(settings: Settings | None = None) -> tuple[str, str]
     Requests offline access so a refresh token is issued.
     """
     settings = settings or get_settings()
-    flow = create_oauth_flow(settings)
+    code_verifier = generate_code_verifier()
+    flow = create_oauth_flow(settings, code_verifier=code_verifier)
     # Deliberately omit include_granted_scopes so we only request the
     # explicitly configured read-only Gmail/Calendar/YouTube scopes.
     auth_url, state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
     )
-    if not flow.code_verifier:
-        raise GoogleAuthError("Failed to generate PKCE verifier for Google OAuth.")
-    _save_pending_oauth(state=state, code_verifier=flow.code_verifier)
+    _save_pending_oauth(state=state, code_verifier=code_verifier)
     logger.info("Google OAuth authorization URL generated")
     return auth_url, state
 
