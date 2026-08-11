@@ -96,7 +96,9 @@ class PersonalAgent:
                     {
                         "type": "function",
                         "function": {
-                            "name": tool.name,
+                            # OpenAI-compatible APIs restrict function names to
+                            # letters, numbers, underscores, and hyphens.
+                            "name": self._provider_tool_name(tool.name),
                             "description": tool.description,
                             "parameters": tool.input_schema
                             or {"type": "object", "properties": {}},
@@ -104,6 +106,19 @@ class PersonalAgent:
                     }
                 )
         return catalog
+
+    @staticmethod
+    def _provider_tool_name(tool_name: str) -> str:
+        return tool_name.replace(".", "__")
+
+    @classmethod
+    def _resolve_tool_name(cls, provider_name: str) -> str | None:
+        if provider_name in ALLOWED_AGENT_TOOLS:
+            return provider_name
+        for name in ALLOWED_AGENT_TOOLS:
+            if cls._provider_tool_name(name) == provider_name:
+                return name
+        return None
 
     @staticmethod
     def _clean_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -136,7 +151,8 @@ class PersonalAgent:
         }
 
     async def _execute_tool_call(self, call: LLMToolCall) -> str:
-        if call.name not in ALLOWED_AGENT_TOOLS:
+        tool_name = self._resolve_tool_name(call.name)
+        if tool_name is None:
             logger.warning("Model requested disallowed tool '%s'", call.name)
             return self._tool_result_json(
                 success=False,
@@ -146,7 +162,7 @@ class PersonalAgent:
             return self._tool_result_json(success=False, error=call.argument_error)
 
         try:
-            tool = self._mcp.get_tool(call.name)
+            tool = self._mcp.get_tool(tool_name)
             validation_error = _validate_arguments(call.arguments, tool.input_schema)
         except MCPError:
             validation_error = "The requested tool is not available."
@@ -154,9 +170,9 @@ class PersonalAgent:
             return self._tool_result_json(success=False, error=validation_error)
 
         try:
-            result = await self._mcp.call_tool(call.name, call.arguments)
+            result = await self._mcp.call_tool(tool_name, call.arguments)
         except MCPError as exc:
-            logger.error("Agent MCP tool failed (%s): %s", call.name, exc)
+            logger.error("Agent MCP tool failed (%s): %s", tool_name, exc)
             return self._tool_result_json(success=False, error=str(exc))
         if not isinstance(result, dict):
             return self._tool_result_json(

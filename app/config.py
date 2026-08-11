@@ -30,6 +30,7 @@ class Settings:
     app_env: str
     telegram_bot_token: str | None
     telegram_chat_id: str | None
+    telegram_webhook_secret: str | None
     timezone: str
     briefing_time: str
     google_client_id: str | None
@@ -45,6 +46,30 @@ class Settings:
     @property
     def telegram_configured(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def is_serverless(self) -> bool:
+        """True on Vercel / production where long-running pollers cannot run."""
+        if os.getenv("VERCEL", "").strip():
+            return True
+        return self.app_env.lower() in {"production", "prod"}
+
+    @property
+    def telegram_transport(self) -> str:
+        """
+        How inbound Telegram messages are received.
+
+        Local development uses long polling. Vercel/production uses webhooks.
+        """
+        if not self.telegram_configured:
+            return "disabled"
+        if self.is_serverless:
+            return "webhook"
+        return "polling"
+
+    @property
+    def telegram_webhook_configured(self) -> bool:
+        return self.telegram_configured and bool(self.telegram_webhook_secret)
 
     @property
     def google_configured(self) -> bool:
@@ -113,6 +138,7 @@ def get_settings() -> Settings:
         app_env=os.getenv("APP_ENV", "development").strip() or "development",
         telegram_bot_token=_optional("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_optional("TELEGRAM_CHAT_ID"),
+        telegram_webhook_secret=_optional("TELEGRAM_WEBHOOK_SECRET"),
         timezone=os.getenv("TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata",
         briefing_time=os.getenv("BRIEFING_TIME", "19:00").strip() or "19:00",
         google_client_id=_optional("GOOGLE_CLIENT_ID"),

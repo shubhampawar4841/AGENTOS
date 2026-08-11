@@ -7,18 +7,25 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.agent import PersonalAgent, process_message
 from app.agent.state import ConversationStore
-from app.config import ConfigurationError, get_settings
+from app.config import ConfigurationError, Settings, get_settings
 from app.integrations.google_auth import (
     GoogleAuthError,
     build_authorization_url,
     exchange_code_for_tokens,
 )
-from app.integrations.telegram import TelegramError, TelegramPoller, TelegramService
+from app.integrations.telegram import (
+    TELEGRAM_SECRET_HEADER,
+    TelegramError,
+    TelegramPoller,
+    TelegramService,
+    handle_update,
+    validate_webhook_secret,
+)
 from app.mcp import MCPError
 from app.mcp.client import MCPClient, create_default_mcp_client
 from app.scheduler.jobs import create_scheduler
@@ -32,6 +39,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _build_telegram_message_handler(app: FastAPI):
+    async def _handle(text: str, chat_id: str) -> str:
+        async def _run(
+            current_message: str,
+            history: list[dict[str, str]],
+        ) -> str:
+            return await process_message(
+                current_message,
+                app.state.agent,
+                conversation_history=history,
+            )
+
+        return await app.state.conversation_store.process_turn(
+            chat_id,
+            text,
+            _run,
+        )
+
+    return _handle
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -42,47 +70,52 @@ async def lifespan(app: FastAPI):
     app.state.llm = LLMService(settings)
     app.state.agent = PersonalAgent(app.state.mcp_client, app.state.llm)
     app.state.conversation_store = ConversationStore(max_messages=20)
+    app.state.telegram = None
+    app.state.telegram_message_handler = None
+    app.state.telegram_poller = None
     logger.info(
         "MCP client ready with tools: %s",
         [t.name for t in app.state.mcp_client.list_tools()],
     )
 
-    try:
-        scheduler = create_scheduler(settings, app.state.mcp_client)
-        scheduler.start()
-        app.state.scheduler = scheduler
-        logger.info("Scheduler started")
-    except ConfigurationError as exc:
-        logger.error("Scheduler configuration error: %s", exc)
-        raise
+    # Long-running schedulers are unreliable on Vercel serverless; keep local only.
+    if not settings.is_serverless:
+        try:
+            scheduler = create_scheduler(settings, app.state.mcp_client)
+            scheduler.start()
+            app.state.scheduler = scheduler
+            logger.info("Scheduler started")
+        except ConfigurationError as exc:
+            logger.error("Scheduler configuration error: %s", exc)
+            raise
+    else:
+        app.state.scheduler = None
+        logger.info("Scheduler skipped (serverless/production webhook mode)")
 
     if settings.telegram_configured:
         telegram = TelegramService.from_settings(settings)
+        handler = _build_telegram_message_handler(app)
+        app.state.telegram = telegram
+        app.state.telegram_message_handler = handler
 
-        async def _handle(text: str, chat_id: str) -> str:
-            async def _run(
-                current_message: str,
-                history: list[dict[str, str]],
-            ) -> str:
-                return await process_message(
-                    current_message,
-                    app.state.agent,
-                    conversation_history=history,
-                )
-
-            return await app.state.conversation_store.process_turn(
-                chat_id,
-                text,
-                _run,
+        if settings.telegram_transport == "polling":
+            poller = TelegramPoller(telegram, handler)
+            app.state.telegram_poller = poller
+            await poller.start()
+            logger.info("Telegram transport=polling")
+        else:
+            logger.info(
+                "Telegram transport=webhook "
+                "(polling disabled on serverless/production)"
             )
-
-        poller = TelegramPoller(telegram, _handle)
-        app.state.telegram_poller = poller
-        await poller.start()
+            if not settings.telegram_webhook_configured:
+                logger.warning(
+                    "TELEGRAM_WEBHOOK_SECRET is not set; "
+                    "webhook requests will be rejected until it is configured"
+                )
     else:
-        app.state.telegram_poller = None
         logger.warning(
-            "Telegram polling not started "
+            "Telegram not configured "
             "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
         )
 
@@ -99,7 +132,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Personal Agentic OS",
     description="Single-user personal AI assistant foundation",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -107,6 +140,96 @@ app = FastAPI(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/telegram/webhook/status")
+async def telegram_webhook_status() -> JSONResponse:
+    """Safe Telegram transport status (never returns secrets)."""
+    settings = get_settings()
+    return JSONResponse(
+        {
+            "configured": settings.telegram_configured,
+            "webhook_secret_configured": bool(settings.telegram_webhook_secret),
+            "mode": settings.telegram_transport,
+            "serverless": settings.is_serverless,
+            # Note: conversation history is in-memory and ephemeral on Vercel.
+            "conversation_memory": "in_memory_ephemeral",
+        }
+    )
+
+
+async def _process_telegram_webhook(
+    request: Request,
+    *,
+    path_secret: str | None,
+    header_secret: str | None,
+) -> JSONResponse:
+    settings: Settings = get_settings()
+    if not settings.telegram_configured:
+        raise HTTPException(status_code=503, detail="Telegram is not configured")
+    if not validate_webhook_secret(
+        settings.telegram_webhook_secret,
+        path_secret=path_secret,
+        header_secret=header_secret,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    try:
+        update = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(update, dict):
+        raise HTTPException(status_code=400, detail="Telegram update must be an object")
+
+    telegram: TelegramService | None = getattr(app.state, "telegram", None)
+    handler = getattr(app.state, "telegram_message_handler", None)
+    if telegram is None or handler is None:
+        # Cold start / incomplete lifespan — build ephemeral handlers.
+        telegram = TelegramService.from_settings(settings)
+        handler = _build_telegram_message_handler(app)
+        app.state.telegram = telegram
+        app.state.telegram_message_handler = handler
+
+    result = await handle_update(
+        update,
+        telegram=telegram,
+        message_handler=handler,
+    )
+    # Telegram retries on non-2xx; always acknowledge after processing attempt.
+    return JSONResponse({"ok": True, **result})
+
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook_header(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(
+        default=None,
+        alias=TELEGRAM_SECRET_HEADER,
+    ),
+) -> JSONResponse:
+    """Webhook endpoint authenticated via Telegram secret-token header."""
+    return await _process_telegram_webhook(
+        request,
+        path_secret=None,
+        header_secret=x_telegram_bot_api_secret_token,
+    )
+
+
+@app.post("/api/telegram/webhook/{webhook_secret}")
+async def telegram_webhook_path(
+    request: Request,
+    webhook_secret: str = Path(...),
+    x_telegram_bot_api_secret_token: str | None = Header(
+        default=None,
+        alias=TELEGRAM_SECRET_HEADER,
+    ),
+) -> JSONResponse:
+    """Webhook endpoint authenticated via secret path segment and/or header."""
+    return await _process_telegram_webhook(
+        request,
+        path_secret=webhook_secret,
+        header_secret=x_telegram_bot_api_secret_token,
+    )
 
 
 @app.get("/auth/google")

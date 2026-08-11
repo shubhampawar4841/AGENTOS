@@ -166,7 +166,10 @@ async def test_poller_handles_allowed_chat(settings_env):
             "message": {"chat": {"id": 12345}, "text": "What emails did I get today?"},
         }
     )
-    handler.assert_awaited_once()
+    handler.assert_awaited_once_with(
+        "What emails did I get today?",
+        "12345",
+    )
     telegram.send_message.assert_awaited_once()
     assert poller._offset == 43
 

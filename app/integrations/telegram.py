@@ -1,9 +1,10 @@
-"""Telegram Bot API integration: send + long-poll receive."""
+"""Telegram Bot API integration: send + polling/webhook receive."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_BASE = "https://api.telegram.org"
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 SAFE_CHUNK_LEN = 3900
+TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 
 
 class TelegramError(Exception):
@@ -45,6 +47,72 @@ def split_telegram_message(text: str, limit: int = SAFE_CHUNK_LEN) -> list[str]:
         chunks.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip("\n")
     return chunks
+
+
+def validate_webhook_secret(
+    expected_secret: str | None,
+    *,
+    path_secret: str | None = None,
+    header_secret: str | None = None,
+) -> bool:
+    """
+    Timing-safe webhook secret check.
+
+    Accepts either the path segment or Telegram's secret-token header.
+    Never logs the secret values.
+    """
+    if not expected_secret:
+        return False
+    candidates = [value for value in (path_secret, header_secret) if value]
+    return any(secrets.compare_digest(candidate, expected_secret) for candidate in candidates)
+
+
+async def handle_update(
+    update: dict[str, Any],
+    *,
+    telegram: TelegramService,
+    message_handler: MessageHandler,
+) -> dict[str, Any]:
+    """
+    Shared inbound update processor for polling and webhooks.
+
+    Both transports must share this path so agent behavior stays identical.
+    """
+    update_id = update.get("update_id")
+    message = update.get("message") or {}
+    if not isinstance(message, dict):
+        return {"handled": False, "reason": "no_message", "update_id": update_id}
+
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id", ""))
+    if not chat_id:
+        return {"handled": False, "reason": "missing_chat_id", "update_id": update_id}
+
+    if chat_id != telegram.allowed_chat_id:
+        logger.warning("Ignoring Telegram message from unauthorized chat_id")
+        return {"handled": False, "reason": "unauthorized_chat", "update_id": update_id}
+
+    text = message.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return {"handled": False, "reason": "empty_text", "update_id": update_id}
+
+    try:
+        reply = await message_handler(text.strip(), chat_id)
+    except Exception:
+        logger.exception("Agent failed while handling Telegram message")
+        reply = "⚠️ Something went wrong while processing that. Please try again."
+
+    try:
+        await telegram.send_message(reply, chat_id=chat_id)
+    except TelegramError as exc:
+        logger.error("Failed to send Telegram reply: %s", exc)
+        return {
+            "handled": False,
+            "reason": "send_failed",
+            "update_id": update_id,
+        }
+
+    return {"handled": True, "update_id": update_id}
 
 
 class TelegramService:
@@ -162,7 +230,7 @@ class TelegramPoller:
     Background long-polling loop for inbound Telegram messages.
 
     Only messages from the configured TELEGRAM_CHAT_ID are processed.
-    Offset is kept in memory (no database).
+    Offset is kept in memory (no database). Local development only.
     """
 
     def __init__(
@@ -237,28 +305,19 @@ class TelegramPoller:
         update_id = update.get("update_id")
         if isinstance(update_id, int):
             self._offset = update_id + 1
+        await handle_update(
+            update,
+            telegram=self._telegram,
+            message_handler=self._handler,
+        )
 
-        message = update.get("message") or {}
-        if not isinstance(message, dict):
-            return
-
-        chat = message.get("chat") or {}
-        chat_id = str(chat.get("id", ""))
-        if chat_id != self._telegram.allowed_chat_id:
-            logger.warning("Ignoring Telegram message from unauthorized chat_id")
-            return
-
-        text = message.get("text")
-        if not isinstance(text, str) or not text.strip():
-            return
-
-        try:
-            reply = await self._handler(text.strip(), chat_id)
-        except Exception:
-            logger.exception("Agent failed while handling Telegram message")
-            reply = "⚠️ Something went wrong while processing that. Please try again."
-
-        try:
-            await self._telegram.send_message(reply, chat_id=chat_id)
-        except TelegramError as exc:
-            logger.error("Failed to send Telegram reply: %s", exc)
+    async def handle_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        """Public alias used by webhook and tests (also advances poller offset)."""
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            self._offset = update_id + 1
+        return await handle_update(
+            update,
+            telegram=self._telegram,
+            message_handler=self._handler,
+        )
