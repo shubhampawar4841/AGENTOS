@@ -51,6 +51,7 @@ def test_telegram_service_requires_configuration():
             telegram_bot_token=None,
             telegram_chat_id=None,
             telegram_webhook_secret=None,
+            telegram_mode=None,
             timezone="Asia/Kolkata",
             briefing_time="19:00",
             google_client_id=None,

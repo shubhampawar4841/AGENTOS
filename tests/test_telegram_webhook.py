@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import get_settings
+from app.config import ConfigurationError, get_settings
 from app.integrations.telegram import (
     TelegramService,
     handle_update,
@@ -25,7 +25,9 @@ def _clear_settings_cache():
 @pytest.fixture
 def settings_env(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_ENV", "test")
+    # Ignore the developer's local .env transport choice.
     monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("TELEGRAM_MODE", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "webhook-secret-xyz")
@@ -51,9 +53,20 @@ def test_validate_webhook_secret_accepts_path_or_header():
     assert validate_webhook_secret(None, path_secret="abc") is False
 
 
-def test_telegram_transport_modes(settings_env, monkeypatch):
+def test_transport_defaults_to_webhook_outside_local_dev(settings_env):
+    # APP_ENV=test is not a local dev env, so polling must not be inferred.
+    settings = get_settings()
+    assert settings.telegram_transport == "webhook"
+    assert settings.polling_enabled is False
+
+
+def test_local_development_uses_polling(settings_env, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    get_settings.cache_clear()
     assert get_settings().telegram_transport == "polling"
 
+
+def test_production_and_vercel_use_webhook(settings_env, monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     get_settings.cache_clear()
     assert get_settings().telegram_transport == "webhook"
@@ -61,8 +74,46 @@ def test_telegram_transport_modes(settings_env, monkeypatch):
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("VERCEL", "1")
     get_settings.cache_clear()
+    settings = get_settings()
+    assert settings.is_serverless is True
+    assert settings.telegram_transport == "webhook"
+    assert settings.polling_enabled is False
+
+
+def test_explicit_telegram_mode_overrides_environment(settings_env, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("TELEGRAM_MODE", "webhook")
+    get_settings.cache_clear()
     assert get_settings().telegram_transport == "webhook"
-    assert get_settings().is_serverless is True
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("TELEGRAM_MODE", "polling")
+    get_settings.cache_clear()
+    assert get_settings().telegram_transport == "polling"
+
+
+def test_invalid_telegram_mode_fails_fast(settings_env, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_MODE", "sockets")
+    get_settings.cache_clear()
+    with pytest.raises(ConfigurationError):
+        get_settings()
+
+
+def test_transport_disabled_without_telegram_credentials(settings_env, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "")
+    get_settings.cache_clear()
+    assert get_settings().telegram_transport == "disabled"
+
+
+def test_root_endpoint(settings_env):
+    from app.main import app
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "SYNCOS"}
 
 
 @pytest.mark.asyncio
@@ -135,6 +186,21 @@ def test_production_does_not_start_poller(production_env):
         assert client.app.state.telegram is not None
         status = client.get("/telegram/webhook/status").json()
         assert status["mode"] == "webhook"
+
+
+def test_webhook_requires_configured_secret(production_env, monkeypatch):
+    from app.main import app
+
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+    get_settings.cache_clear()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/telegram/webhook",
+            json={"update_id": 1, "message": {"chat": {"id": 12345}, "text": "hey"}},
+        )
+
+    assert response.status_code == 503
 
 
 def test_webhook_rejects_bad_secret(production_env):

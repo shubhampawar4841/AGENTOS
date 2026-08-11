@@ -95,22 +95,21 @@ async def lifespan(app: FastAPI):
         app.state.scheduler = None
         logger.info("Scheduler skipped (serverless/production webhook mode)")
 
+    transport = settings.telegram_transport
     if settings.telegram_configured:
         telegram = TelegramService.from_settings(settings)
         handler = _build_telegram_message_handler(app)
         app.state.telegram = telegram
         app.state.telegram_message_handler = handler
 
-        if settings.telegram_transport == "polling":
+        # Polling is a long-running task and must never start on serverless.
+        if settings.polling_enabled:
             poller = TelegramPoller(telegram, handler)
             app.state.telegram_poller = poller
             await poller.start()
-            logger.info("Telegram transport=polling")
+            logger.info("Telegram transport=polling (local development)")
         else:
-            logger.info(
-                "Telegram transport=webhook "
-                "(polling disabled on serverless/production)"
-            )
+            logger.info("Telegram transport=webhook (polling disabled)")
             if not settings.telegram_webhook_configured:
                 logger.warning(
                     "TELEGRAM_WEBHOOK_SECRET is not set; "
@@ -119,7 +118,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(
             "Telegram not configured "
-            "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)"
+            "(set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID); transport=%s",
+            transport,
         )
 
     try:
@@ -140,6 +140,11 @@ app = FastAPI(
 )
 
 
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"status": "ok", "service": "SYNCOS"}
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -154,7 +159,9 @@ async def telegram_webhook_status() -> JSONResponse:
             "configured": settings.telegram_configured,
             "webhook_secret_configured": bool(settings.telegram_webhook_secret),
             "mode": settings.telegram_transport,
+            "mode_explicit": settings.telegram_mode is not None,
             "serverless": settings.is_serverless,
+            "polling_enabled": settings.polling_enabled,
             # Note: conversation history is in-memory and ephemeral on Vercel.
             "conversation_memory": "in_memory_ephemeral",
         }
@@ -170,6 +177,11 @@ async def _process_telegram_webhook(
     settings: Settings = get_settings()
     if not settings.telegram_configured:
         raise HTTPException(status_code=503, detail="Telegram is not configured")
+    if not settings.telegram_webhook_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook secret is not configured. Set TELEGRAM_WEBHOOK_SECRET.",
+        )
     if not validate_webhook_secret(
         settings.telegram_webhook_secret,
         path_secret=path_secret,

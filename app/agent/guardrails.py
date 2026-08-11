@@ -30,9 +30,16 @@ _SERVICE_HINTS: dict[str, tuple[str, ...]] = {
         r"\bschedule[ds]?\b",
         r"\bevents?\b",
         r"\bappointments?\b",
-        r"\binterview\b",
     ),
     "youtube": (r"\byoutube\b", r"\bvideos?\b", r"\buploads?\b", r"\bchannels?\b"),
+}
+
+# Unambiguous references to a specific service, used when other data is verified
+# so that legitimate synthesis (an email that mentions a meeting) is not blocked.
+_SERVICE_NAME_HINTS: dict[str, tuple[str, ...]] = {
+    "gmail": (r"\bgmail\b", r"\binbox\b"),
+    "calendar": (r"\bcalendar\b", r"\bschedule[ds]?\b"),
+    "youtube": (r"\byoutube\b",),
 }
 
 # Phrasings that assert the assistant already observed real user data.
@@ -49,6 +56,11 @@ _ACCESS_CLAIM_PATTERNS: tuple[str, ...] = (
     r"a\s+few|several|some|only)\b",
     r"\byour\s+(?:inbox|calendar|schedule)\s+(?:has|shows|contains|includes)\b",
     r"\bthe\s+(?:top|most\s+important)\s+\d+\b",
+    # Describing specific items counts as a claim even without an "I checked" phrase.
+    r"\b(?:those|these|your|the)\s+(?:\d+|one|two|three|four|five)\s+"
+    r"(?:e-?mails?|messages?|meetings?|events?|videos?|uploads?)\b",
+    r"\byour\s+(?:e-?mails?|messages?|meetings?|events?|videos?|uploads?)\s+"
+    r"(?:were|was|are|is|include[ds]?|contain(?:ed)?|say|said|mention(?:ed)?)\b",
 )
 
 # Honest failure/ability statements must never be treated as data claims.
@@ -104,11 +116,12 @@ def strip_raw_tool_syntax(text: str) -> str:
     return _RAW_TOOL_BLOCK.sub("", text or "").strip()
 
 
-def mentioned_services(text: str) -> tuple[str, ...]:
+def mentioned_services(text: str, *, names_only: bool = False) -> tuple[str, ...]:
     lowered = (text or "").lower()
+    hint_source = _SERVICE_NAME_HINTS if names_only else _SERVICE_HINTS
     found = [
         service
-        for service, hints in _SERVICE_HINTS.items()
+        for service, hints in hint_source.items()
         if any(re.search(hint, lowered) for hint in hints)
     ]
     return tuple(found)
@@ -135,9 +148,13 @@ def unverified_claimed_services(
     """Services the text talks about as observed data without verified provenance."""
     if not claims_external_data(text):
         return ()
+    # Once some service is verified, only an unambiguous reference to another
+    # service counts, so summarizing a verified email that mentions a meeting
+    # is not mistaken for a calendar claim.
+    names_only = bool(verified_services)
     return tuple(
         service
-        for service in mentioned_services(text)
+        for service in mentioned_services(text, names_only=names_only)
         if service not in verified_services
     )
 

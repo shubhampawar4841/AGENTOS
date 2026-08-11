@@ -231,7 +231,11 @@ async def test_llm_failure_has_stable_user_facing_message():
 async def test_conversation_store_is_bounded_and_isolated():
     store = ConversationStore(max_messages=4)
 
-    async def echo(message: str, history: list[dict[str, str]]) -> str:
+    async def echo(
+        message: str,
+        history: list[dict[str, str]],
+        verified: dict[str, object],
+    ) -> str:
         return f"{len(history)}:{message}"
 
     await store.process_turn("chat-a", "one", echo)

@@ -17,6 +17,8 @@ load_dotenv()
 DEFAULT_GOOGLE_REDIRECT_URI = "https://agentos-rosy.vercel.app/auth/google/callback"
 DEFAULT_GOOGLE_TOKEN_PATH = "tokens/google_token.json"
 DEFAULT_LLM_PROVIDER = "none"
+TELEGRAM_MODES = frozenset({"polling", "webhook"})
+LOCAL_APP_ENVS = frozenset({"development", "dev", "local"})
 
 
 class ConfigurationError(Exception):
@@ -31,6 +33,7 @@ class Settings:
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     telegram_webhook_secret: str | None
+    telegram_mode: str | None
     timezone: str
     briefing_time: str
     google_client_id: str | None
@@ -52,20 +55,31 @@ class Settings:
         """True on Vercel / production where long-running pollers cannot run."""
         if os.getenv("VERCEL", "").strip():
             return True
-        return self.app_env.lower() in {"production", "prod"}
+        return self.app_env.lower() in {"production", "prod", "staging"}
 
     @property
     def telegram_transport(self) -> str:
         """
         How inbound Telegram messages are received.
 
-        Local development uses long polling. Vercel/production uses webhooks.
+        Resolved from the explicit TELEGRAM_MODE setting when present. Otherwise
+        only a local development environment gets long polling; every other
+        environment (including Vercel) defaults to webhooks so a serverless
+        deployment can never start an infinite getUpdates loop.
         """
         if not self.telegram_configured:
             return "disabled"
+        if self.telegram_mode in TELEGRAM_MODES:
+            return self.telegram_mode
         if self.is_serverless:
             return "webhook"
-        return "polling"
+        if self.app_env.lower() in LOCAL_APP_ENVS:
+            return "polling"
+        return "webhook"
+
+    @property
+    def polling_enabled(self) -> bool:
+        return self.telegram_transport == "polling"
 
     @property
     def telegram_webhook_configured(self) -> bool:
@@ -124,6 +138,11 @@ def _optional(name: str) -> str | None:
     return value or None
 
 
+def _lower_optional(name: str) -> str | None:
+    value = _optional(name)
+    return value.lower() if value else None
+
+
 def _csv_ids(name: str) -> tuple[str, ...]:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -139,6 +158,7 @@ def get_settings() -> Settings:
         telegram_bot_token=_optional("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_optional("TELEGRAM_CHAT_ID"),
         telegram_webhook_secret=_optional("TELEGRAM_WEBHOOK_SECRET"),
+        telegram_mode=_lower_optional("TELEGRAM_MODE"),
         timezone=os.getenv("TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata",
         briefing_time=os.getenv("BRIEFING_TIME", "19:00").strip() or "19:00",
         google_client_id=_optional("GOOGLE_CLIENT_ID"),
@@ -162,5 +182,10 @@ def get_settings() -> Settings:
     )
     # Validate scheduler config eagerly so bad values fail fast at startup.
     settings.briefing_hour_minute()
+    if settings.telegram_mode is not None and settings.telegram_mode not in TELEGRAM_MODES:
+        raise ConfigurationError(
+            f"Invalid TELEGRAM_MODE '{settings.telegram_mode}'. "
+            "Expected 'polling' (local development) or 'webhook' (production)."
+        )
     logger.debug("Loaded settings for env=%s timezone=%s", settings.app_env, settings.timezone)
     return settings
