@@ -78,7 +78,7 @@ def main() -> int:
 
     if _write_chat_id(chat_id):
         print(f"\nWrote TELEGRAM_CHAT_ID={chat_id} to .env")
-        print("Restart the server, then: curl -X POST http://localhost:3000/test/telegram")
+        print("Restart the server, then: curl -X POST https://agentos-rosy.vercel.app/test/telegram")
     return 0
 
 

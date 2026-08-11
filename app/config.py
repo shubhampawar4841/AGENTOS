@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-DEFAULT_GOOGLE_REDIRECT_URI = "http://localhost:3000/auth/google/callback"
+DEFAULT_GOOGLE_REDIRECT_URI = "https://agentos-rosy.vercel.app/auth/google/callback"
 DEFAULT_GOOGLE_TOKEN_PATH = "tokens/google_token.json"
 DEFAULT_LLM_PROVIDER = "none"
 
