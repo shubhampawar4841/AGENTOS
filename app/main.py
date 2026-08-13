@@ -283,11 +283,12 @@ async def auth_google_callback(
             detail="Missing authorization code. Start again at /auth/google.",
         )
 
+    settings = get_settings()
     try:
-        exchange_code_for_tokens(
+        credentials = exchange_code_for_tokens(
             authorization_response=str(request.url),
             state=state,
-            settings=get_settings(),
+            settings=settings,
         )
     except ConfigurationError as exc:
         logger.error("Google OAuth configuration error: %s", exc)
@@ -296,11 +297,31 @@ async def auth_google_callback(
         logger.error("Google OAuth callback failed: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if settings.google_token_file().exists():
+        return JSONResponse(
+            {
+                "success": True,
+                "message": "Google account connected. You can now call GET /test/gmail.",
+            }
+        )
+
+    # Ephemeral filesystem (e.g. Vercel): the token cannot outlive this request,
+    # so hand it to the user who just authenticated to store as GOOGLE_TOKEN_JSON.
+    logger.warning(
+        "Google token could not be persisted; returning it for GOOGLE_TOKEN_JSON"
+    )
     return JSONResponse(
         {
             "success": True,
-            "message": "Google account connected. You can now call GET /test/gmail.",
-        }
+            "action_required": (
+                "This deployment has no writable storage, so the token cannot be "
+                "saved here. Copy the 'google_token_json' value below into an "
+                "environment variable named GOOGLE_TOKEN_JSON, then redeploy. "
+                "You only need to do this once."
+            ),
+            "google_token_json": credentials.to_json(),
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 

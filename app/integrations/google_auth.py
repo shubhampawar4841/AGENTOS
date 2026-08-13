@@ -236,25 +236,28 @@ def exchange_code_for_tokens(
     return credentials
 
 
-def save_credentials(credentials: Credentials, token_path: Path | str) -> None:
+def save_credentials(credentials: Credentials, token_path: Path | str) -> bool:
     """
     Persist OAuth credentials to a local JSON file (never log secrets).
 
-    On read-only/ephemeral filesystems (e.g. Vercel) writing is best-effort: the
-    in-memory credential is still usable for the current request, and durable
-    storage comes from the GOOGLE_TOKEN_JSON environment variable instead.
+    Returns whether the write succeeded. On read-only/ephemeral filesystems
+    (e.g. Vercel) writing is best-effort: the in-memory credential is still
+    usable for the current request, and durable storage comes from the
+    GOOGLE_TOKEN_JSON environment variable instead.
     """
     path = Path(token_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(credentials.to_json(), encoding="utf-8")
         logger.info("Wrote Google credentials to %s", path)
+        return True
     except OSError as exc:
         logger.warning(
             "Could not persist Google credentials to disk (%s); "
             "continuing with in-memory token",
             type(exc).__name__,
         )
+        return False
 
 
 def _load_credentials_from_env(
