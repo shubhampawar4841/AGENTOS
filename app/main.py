@@ -18,6 +18,7 @@ from app.integrations.google_auth import (
     GoogleAuthError,
     build_authorization_url,
     exchange_code_for_tokens,
+    export_credentials_json,
 )
 from app.integrations.telegram import (
     TELEGRAM_SECRET_HEADER,
@@ -299,6 +300,37 @@ async def auth_google_callback(
         {
             "success": True,
             "message": "Google account connected. You can now call GET /test/gmail.",
+        }
+    )
+
+
+@app.get("/auth/google/token")
+async def auth_google_token() -> JSONResponse:
+    """
+    Return the current Google token JSON for GOOGLE_TOKEN_JSON.
+
+    Local-only helper: it exposes a refresh token, so it is refused on
+    serverless/production where the response could travel over the network.
+    """
+    settings = get_settings()
+    if settings.is_serverless:
+        raise HTTPException(
+            status_code=403,
+            detail="Token export is disabled in production for safety. "
+            "Run this locally after /auth/google.",
+        )
+    try:
+        token_json = export_credentials_json(settings)
+    except GoogleAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JSONResponse(
+        {
+            "instructions": (
+                "Copy the value of 'google_token_json' into a Vercel environment "
+                "variable named GOOGLE_TOKEN_JSON, then redeploy."
+            ),
+            "google_token_json": token_json,
         }
     )
 

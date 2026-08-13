@@ -49,8 +49,23 @@ def main() -> int:
     api = f"https://api.telegram.org/bot{token}"
 
     with httpx.Client(timeout=30.0) as client:
+        # Fail loudly on a dead token instead of reporting an empty webhook.
+        identity = client.get(f"{api}/getMe").json()
+        if not identity.get("ok"):
+            print(
+                "Telegram rejected the bot token "
+                f"({identity.get('description', 'unknown error')}). "
+                "Get a fresh token from @BotFather and update TELEGRAM_BOT_TOKEN "
+                "in .env and in your deployment."
+            )
+            return 1
+
         if args.info:
-            info = client.get(f"{api}/getWebhookInfo").json().get("result", {})
+            data = client.get(f"{api}/getWebhookInfo").json()
+            if not data.get("ok"):
+                print("getWebhookInfo failed:", data.get("description", "unknown error"))
+                return 1
+            info = data.get("result", {})
             print("url:", _redact_url(info.get("url", "")))
             print("pending_update_count:", info.get("pending_update_count"))
             print("last_error_message:", info.get("last_error_message"))

@@ -13,4 +13,3 @@ build/
 .coverage
 htmlcov/
 tokens/
-.env.example

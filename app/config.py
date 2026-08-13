@@ -40,6 +40,7 @@ class Settings:
     google_client_secret: str | None
     google_redirect_uri: str
     google_token_path: str
+    google_token_json: str | None
     llm_provider: str
     llm_api_key: str | None
     llm_model: str | None
@@ -171,6 +172,7 @@ def get_settings() -> Settings:
             os.getenv("GOOGLE_TOKEN_PATH", DEFAULT_GOOGLE_TOKEN_PATH).strip()
             or DEFAULT_GOOGLE_TOKEN_PATH
         ),
+        google_token_json=_optional("GOOGLE_TOKEN_JSON"),
         llm_provider=(
             os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
             or DEFAULT_LLM_PROVIDER

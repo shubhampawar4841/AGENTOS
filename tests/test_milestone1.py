@@ -58,6 +58,7 @@ def test_telegram_service_requires_configuration():
             google_client_secret=None,
             google_redirect_uri="http://localhost:3000/auth/google/callback",
             google_token_path="tokens/google_token.json",
+            google_token_json=None,
             llm_provider="none",
             llm_api_key=None,
             llm_model=None,

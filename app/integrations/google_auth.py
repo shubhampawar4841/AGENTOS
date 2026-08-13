@@ -211,27 +211,71 @@ def exchange_code_for_tokens(
 
 
 def save_credentials(credentials: Credentials, token_path: Path | str) -> None:
-    """Persist OAuth credentials to a local JSON file (never log secrets)."""
-    path = Path(token_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(credentials.to_json(), encoding="utf-8")
-    logger.info("Wrote Google credentials to %s", path)
+    """
+    Persist OAuth credentials to a local JSON file (never log secrets).
 
-
-def load_credentials(token_path: Path | str, scopes: list[str] | None = None) -> Credentials:
-    """Load credentials from disk. Does not refresh."""
+    On read-only/ephemeral filesystems (e.g. Vercel) writing is best-effort: the
+    in-memory credential is still usable for the current request, and durable
+    storage comes from the GOOGLE_TOKEN_JSON environment variable instead.
+    """
     path = Path(token_path)
-    if not path.exists():
-        raise GoogleAuthRequiredError(
-            "Google account is not connected. Open /auth/google to authenticate."
-        )
     try:
-        return Credentials.from_authorized_user_file(str(path), scopes or SCOPES)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(credentials.to_json(), encoding="utf-8")
+        logger.info("Wrote Google credentials to %s", path)
+    except OSError as exc:
+        logger.warning(
+            "Could not persist Google credentials to disk (%s); "
+            "continuing with in-memory token",
+            type(exc).__name__,
+        )
+
+
+def _load_credentials_from_env(
+    settings: Settings,
+    scopes: list[str] | None = None,
+) -> Credentials | None:
+    """Load credentials from GOOGLE_TOKEN_JSON when present (serverless-friendly)."""
+    raw = settings.google_token_json
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return Credentials.from_authorized_user_info(data, scopes or SCOPES)
     except Exception as exc:
-        logger.error("Failed to load Google credentials file: %s", type(exc).__name__)
+        logger.error(
+            "GOOGLE_TOKEN_JSON is set but invalid: %s", type(exc).__name__
+        )
         raise GoogleAuthError(
-            "Stored Google credentials are invalid. Open /auth/google to authenticate again."
+            "GOOGLE_TOKEN_JSON is present but could not be parsed. "
+            "Regenerate it with GET /auth/google/token after authenticating."
         ) from exc
+
+
+def load_credentials(
+    token_path: Path | str,
+    scopes: list[str] | None = None,
+    settings: Settings | None = None,
+) -> Credentials:
+    """Load credentials from disk, falling back to GOOGLE_TOKEN_JSON."""
+    path = Path(token_path)
+    if path.exists():
+        try:
+            return Credentials.from_authorized_user_file(str(path), scopes or SCOPES)
+        except Exception as exc:
+            logger.error("Failed to load Google credentials file: %s", type(exc).__name__)
+            raise GoogleAuthError(
+                "Stored Google credentials are invalid. "
+                "Open /auth/google to authenticate again."
+            ) from exc
+
+    env_credentials = _load_credentials_from_env(settings or get_settings(), scopes)
+    if env_credentials is not None:
+        return env_credentials
+
+    raise GoogleAuthRequiredError(
+        "Google account is not connected. Open /auth/google to authenticate."
+    )
 
 
 def missing_scopes(credentials: Credentials, required: list[str] | None = None) -> list[str]:
@@ -251,7 +295,7 @@ def get_valid_credentials(settings: Settings | None = None) -> Credentials:
     Never logs access or refresh tokens.
     """
     settings = settings or get_settings()
-    credentials = load_credentials(settings.google_token_file(), SCOPES)
+    credentials = load_credentials(settings.google_token_file(), SCOPES, settings)
 
     missing = missing_scopes(credentials, SCOPES)
     if missing:
@@ -294,4 +338,15 @@ def get_valid_credentials(settings: Settings | None = None) -> Credentials:
 
 def has_stored_credentials(settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
-    return settings.google_token_file().exists()
+    return settings.google_token_file().exists() or bool(settings.google_token_json)
+
+
+def export_credentials_json(settings: Settings | None = None) -> str:
+    """
+    Return the stored credential as JSON for pasting into GOOGLE_TOKEN_JSON.
+
+    Used to move a locally-authenticated token to a serverless deployment.
+    """
+    settings = settings or get_settings()
+    credentials = load_credentials(settings.google_token_file(), SCOPES, settings)
+    return credentials.to_json()
