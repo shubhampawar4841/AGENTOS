@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -67,36 +68,61 @@ def _code_fingerprint(authorization_response: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()[:8]
 
 
+def _pending_oauth_paths() -> list[Path]:
+    """
+    Candidate pending-OAuth locations, most durable first.
+
+    Serverless hosts mount the deployment read-only and expose only the system
+    temp dir for writes, so the temp dir is kept as a fallback.
+    """
+    fallback = Path(tempfile.gettempdir()) / "google_oauth_pending.json"
+    if fallback == PENDING_OAUTH_PATH:
+        return [PENDING_OAUTH_PATH]
+    return [PENDING_OAUTH_PATH, fallback]
+
+
 def _save_pending_oauth(state: str, code_verifier: str) -> None:
-    PENDING_OAUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PENDING_OAUTH_PATH.write_text(
-        json.dumps({"state": state, "code_verifier": code_verifier}),
-        encoding="utf-8",
+    payload = json.dumps({"state": state, "code_verifier": code_verifier})
+    failures: list[str] = []
+    for path in _pending_oauth_paths():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+            return
+        except OSError as exc:
+            failures.append(f"{path}: {type(exc).__name__}")
+
+    logger.error("Could not persist pending OAuth state (%s)", "; ".join(failures))
+    raise GoogleAuthError(
+        "Could not start Google OAuth because no writable location is "
+        "available to hold the PKCE verifier. Complete /auth/google on a "
+        "local run instead, then set GOOGLE_TOKEN_JSON on the deployment."
     )
 
 
 def _load_pending_oauth() -> tuple[str | None, str | None]:
-    if not PENDING_OAUTH_PATH.exists():
-        return None, None
-    try:
-        data = json.loads(PENDING_OAUTH_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None, None
-    if not isinstance(data, dict):
-        return None, None
-    state = data.get("state")
-    verifier = data.get("code_verifier")
-    return (
-        state if isinstance(state, str) else None,
-        verifier if isinstance(verifier, str) else None,
-    )
+    for path in _pending_oauth_paths():
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        state = data.get("state")
+        verifier = data.get("code_verifier")
+        if isinstance(verifier, str) and verifier:
+            return (state if isinstance(state, str) else None, verifier)
+    return None, None
 
 
 def _clear_pending_oauth() -> None:
-    try:
-        PENDING_OAUTH_PATH.unlink(missing_ok=True)
-    except OSError:
-        logger.warning("Failed to clear pending OAuth file")
+    for path in _pending_oauth_paths():
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to clear pending OAuth file")
 
 
 class GoogleAuthError(Exception):
