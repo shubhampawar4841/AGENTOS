@@ -31,6 +31,7 @@ from app.agent.router import (
     plan_tool_calls,
 )
 from app.agent.state import AgentRunResult, ToolExecution
+from app.config import get_settings
 from app.mcp import MCPError
 from app.mcp.client import MCPClient
 from app.services.llm import LLMChatResponse, LLMError, LLMService, LLMToolCall
@@ -94,7 +95,14 @@ class PersonalAgent:
         tool_log: list[ToolExecution] = []
         verified_context = verified_context or {}
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYNCOS_SYSTEM_PROMPT}
+            {
+                "role": "system",
+                "content": (
+                    f"{SYNCOS_SYSTEM_PROMPT}\n\nWhen a Google service cannot be "
+                    f"accessed, give the user this exact link to reconnect: "
+                    f"{get_settings().google_auth_url}"
+                ),
+            }
         ]
         context_message = self._verified_context_message(verified_context)
         if context_message:
@@ -416,7 +424,7 @@ def _auth_error_reply(text: str) -> str | None:
         return (
             "🔐 Google access needs attention "
             "(missing scopes, expired token, or not connected).\n"
-            "Open http://localhost:3000/auth/google to reconnect and grant "
+            f"Open {get_settings().google_auth_url} to reconnect and grant "
             "Gmail + Calendar + YouTube read-only access."
         )
     return None

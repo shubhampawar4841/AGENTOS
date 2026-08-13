@@ -41,6 +41,7 @@ class Settings:
     google_redirect_uri: str
     google_token_path: str
     google_token_json: str | None
+    public_base_url: str | None
     llm_provider: str
     llm_api_key: str | None
     llm_model: str | None
@@ -89,6 +90,18 @@ class Settings:
     @property
     def google_configured(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
+
+    @property
+    def google_auth_url(self) -> str:
+        """Public link the user can open to (re)connect Google, phone included."""
+        if self.public_base_url:
+            return f"{self.public_base_url.rstrip('/')}/auth/google"
+        # Fall back to the host implied by the OAuth redirect URI.
+        redirect = self.google_redirect_uri.strip()
+        marker = "/auth/google/callback"
+        if redirect.endswith(marker):
+            return redirect[: -len("/callback")]
+        return "http://localhost:3000/auth/google"
 
     @property
     def llm_configured(self) -> bool:
@@ -173,6 +186,7 @@ def get_settings() -> Settings:
             or DEFAULT_GOOGLE_TOKEN_PATH
         ),
         google_token_json=_optional("GOOGLE_TOKEN_JSON"),
+        public_base_url=_optional("PUBLIC_BASE_URL"),
         llm_provider=(
             os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
             or DEFAULT_LLM_PROVIDER
